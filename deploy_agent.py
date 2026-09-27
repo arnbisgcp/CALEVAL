@@ -1,41 +1,61 @@
-"""Deploy Healthcare Claims ADK Agent to Vertex AI Agent Engine in arnbtest."""
+"""Deploy Healthcare Claims Multi-Agent System to Vertex AI Agent Engine."""
+
+from __future__ import annotations
 
 import base64
+import io
 import json
+import os
 import pathlib
-import subprocess
 import sys
+import tarfile
 import time
 import urllib.error
 import urllib.request
 
-PROJECT_ID = "arnbtest"
-LOCATION = "us-central1"
+from observability import log_structured_event
+from secrets_manager import secret_manager_service
+
+PROJECT_ID = secret_manager_service.get_secret(
+    "gcp-project-id", default=os.environ.get("GOOGLE_CLOUD_PROJECT", "arnbtest")
+)
+LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
 BASE_URL = f"https://{LOCATION}-aiplatform.googleapis.com/v1beta1"
-ARCHIVE_PATH = pathlib.Path(__file__).resolve().parent / "source.tar.gz"
+ROOT_DIR = pathlib.Path(__file__).resolve().parent
+
+PACKAGED_FILES = [
+    "main.py",
+    "schemas.py",
+    "database.py",
+    "memory_manager.py",
+    "observability.py",
+    "guardrails.py",
+    "secrets_manager.py",
+    "requirements.txt",
+]
 
 
-def get_token() -> str:
-  return subprocess.check_output(
-      [
-          "/google/bin/releases/cloud-sdk-build/gcloud.par",
-          "auth",
-          "print-access-token",
-          f"--project={PROJECT_ID}",
-          "--quiet",
-      ],
-      text=True,
-  ).strip()
+def build_source_archive_b64() -> str:
+  """Packages all agent modules and requirements into an in-memory `.tar.gz` archive."""
+  buf = io.BytesIO()
+  with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+    for filename in PACKAGED_FILES:
+      file_path = ROOT_DIR / filename
+      if file_path.exists():
+        tar.add(str(file_path), arcname=filename)
+  archive_bytes = buf.getvalue()
+  (ROOT_DIR / "source.tar.gz").write_bytes(archive_bytes)
+  return base64.b64encode(archive_bytes).decode("ascii")
 
 
 def main() -> None:
-  archive_b64 = base64.b64encode(ARCHIVE_PATH.read_bytes()).decode("ascii")
+  archive_b64 = build_source_archive_b64()
   payload = {
       "displayName": "Healthcare Claims Agent",
       "description": (
-          "ADK Healthcare Claims Agent with mock member eligibility, claims"
-          " adjudication, prior authorization, cost estimation, and appeal"
-          " workflows."
+          "Multi-agent Google ADK Healthcare Claims System with Pydantic v2 "
+          "schemas, persistent SQLite/vector store, context compaction, "
+          "security guardrails, HITL appeals, and structured JSON telemetry."
       ),
       "spec": {
           "agentFramework": "google-adk",
@@ -81,22 +101,38 @@ def main() -> None:
       },
   }
 
-  token = get_token()
-  create_url = (
-      f"{BASE_URL}/projects/{PROJECT_ID}/locations/{LOCATION}/reasoningEngines"
-  )
+  token = secret_manager_service.get_gcp_access_token()
+  existing_engine_id = os.environ.get("REASONING_ENGINE_ID", "")
+  if existing_engine_id:
+    target_url = (
+        f"{BASE_URL}/projects/{PROJECT_ID}/locations/{LOCATION}/"
+        f"reasoningEngines/{existing_engine_id}?updateMask=spec,displayName,description"
+    )
+    http_method = "PATCH"
+  else:
+    target_url = (
+        f"{BASE_URL}/projects/{PROJECT_ID}/locations/{LOCATION}/reasoningEngines"
+    )
+    http_method = "POST"
+
   req = urllib.request.Request(
-      create_url,
+      target_url,
       data=json.dumps(payload).encode("utf-8"),
       headers={
           "Authorization": f"Bearer {token}",
           "Content-Type": "application/json",
-          "x-goog-user-project": PROJECT_ID,
+          "x-goog-user-project": str(PROJECT_ID),
       },
-      method="POST",
+      method=http_method,
   )
 
-  print(f"Creating Reasoning Engine in {PROJECT_ID}/{LOCATION}...", flush=True)
+  log_structured_event(
+      "DEPLOYMENT_STARTED",
+      f"Submitting Reasoning Engine ({http_method}) in {PROJECT_ID}/{LOCATION}",
+      project_id=PROJECT_ID,
+      location=LOCATION,
+      http_method=http_method,
+  )
   try:
     with urllib.request.urlopen(req, timeout=60) as resp:
       op_data = json.loads(resp.read().decode("utf-8"))
@@ -107,36 +143,26 @@ def main() -> None:
 
   op_name = op_data.get("name", "")
   print(f"Operation started: {op_name}", flush=True)
-  print(json.dumps(op_data, indent=2), flush=True)
 
-  # Poll the LRO until completion
   start_time = time.time()
   while not op_data.get("done", False):
     time.sleep(15)
     elapsed = int(time.time() - start_time)
-    token = get_token()
+    token = secret_manager_service.get_gcp_access_token()
     op_url = f"{BASE_URL}/{op_name}"
     poll_req = urllib.request.Request(
         op_url,
         headers={
             "Authorization": f"Bearer {token}",
-            "x-goog-user-project": PROJECT_ID,
+            "x-goog-user-project": str(PROJECT_ID),
         },
     )
-    try:
-      with urllib.request.urlopen(poll_req, timeout=30) as resp:
-        op_data = json.loads(resp.read().decode("utf-8"))
-      print(
-          f"[{elapsed}s] Polling operation... done={op_data.get('done', False)}",
-          flush=True,
-      )
-    except urllib.error.HTTPError as e:
-      err_body = e.read().decode("utf-8", errors="replace")
-      print(
-          f"[{elapsed}s] Poll HTTP Error {e.code}: {err_body}",
-          file=sys.stderr,
-          flush=True,
-      )
+    with urllib.request.urlopen(poll_req, timeout=30) as resp:
+      op_data = json.loads(resp.read().decode("utf-8"))
+    print(
+        f"[{elapsed}s] Polling operation... done={op_data.get('done', False)}",
+        flush=True,
+    )
 
   if "error" in op_data:
     print(
@@ -146,7 +172,11 @@ def main() -> None:
     )
     sys.exit(1)
 
-  print("Deployment succeeded!", flush=True)
+  log_structured_event(
+      "DEPLOYMENT_SUCCEEDED",
+      "Vertex AI Reasoning Engine deployment completed.",
+      response=op_data.get("response", {}),
+  )
   print(json.dumps(op_data.get("response", op_data), indent=2), flush=True)
 
 

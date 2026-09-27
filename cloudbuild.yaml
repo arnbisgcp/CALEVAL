@@ -1,0 +1,55 @@
+# Google Cloud Build CI/CD Pipeline for Healthcare Claims ADK Multi-Agent System
+steps:
+  # Step 1: Run Unit & Integration Test Suite
+  - name: "python:3.12-slim"
+    id: "unit-tests"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        pip install --no-cache-dir pydantic>=2.7.0 pytest
+        python3 -m unittest discover -s tests -p "test_*.py" -v
+
+  # Step 2: Run Automated Golden Dataset Evaluation Gate (>= 95% Required)
+  - name: "python:3.12-slim"
+    id: "golden-dataset-eval-gate"
+    waitFor: ["unit-tests"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        pip install --no-cache-dir pydantic>=2.7.0
+        python3 evals/run_evaluation.py --min-score 0.95
+
+  # Step 3: Validate Infrastructure-as-Code (Terraform)
+  - name: "hashicorp/terraform:1.7.5"
+    id: "terraform-validate"
+    dir: "terraform"
+    entrypoint: "sh"
+    args:
+      - "-c"
+      - |
+        terraform init -backend=false
+        terraform validate
+
+  # Step 4: Deploy Multi-Agent System to Vertex AI Reasoning Engine
+  - name: "python:3.12-slim"
+    id: "deploy-vertex-reasoning-engine"
+    waitFor: ["golden-dataset-eval-gate", "terraform-validate"]
+    env:
+      - "GOOGLE_CLOUD_PROJECT=$PROJECT_ID"
+      - "GOOGLE_CLOUD_LOCATION=${_REGION}"
+      - "REASONING_ENGINE_ID=${_REASONING_ENGINE_ID}"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        pip install --no-cache-dir -r requirements.txt
+        python3 deploy_agent.py
+
+substitutions:
+  _REGION: "us-central1"
+  _REASONING_ENGINE_ID: "6960836041880109056"
+
+options:
+  logging: CLOUD_LOGGING_ONLY

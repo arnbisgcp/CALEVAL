@@ -1,0 +1,93 @@
+name: Healthcare Claims ADK Agent — CI/CD & Golden Evaluation Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GCP_PROJECT_ID: arnbtest
+  GCP_REGION: us-central1
+
+jobs:
+  unit-tests-and-golden-eval:
+    name: Schema, Guardrail, & Golden Dataset Evaluation Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Test & Evaluation Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pydantic>=2.7.0 pytest
+
+      - name: Run Unit & Integration Test Suite
+        run: |
+          python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Run Golden Dataset Evaluation Gate (>= 95% Required)
+        run: |
+          python evals/run_evaluation.py --min-score 0.95
+
+  terraform-validate:
+    name: Infrastructure-as-Code (Terraform) Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: Terraform Format & Validate
+        working-directory: terraform
+        run: |
+          terraform fmt -check
+          terraform init -backend=false
+          terraform validate
+
+  deploy-vertex-agent-engine:
+    name: Deploy to Vertex AI Agent Engine (Workload Identity Federation)
+    needs: [unit-tests-and-golden-eval, terraform-validate]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Authenticate to Google Cloud via Workload Identity Federation
+        if: env.WIF_PROVIDER != ''
+        uses: google-github-actions/auth@v2
+        env:
+          WIF_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Package & Deploy Reasoning Engine
+        if: env.WIF_PROVIDER != ''
+        env:
+          WIF_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GOOGLE_CLOUD_PROJECT: ${{ env.GCP_PROJECT_ID }}
+          GOOGLE_CLOUD_LOCATION: ${{ env.GCP_REGION }}
+        run: |
+          pip install -r requirements.txt
+          python deploy_agent.py

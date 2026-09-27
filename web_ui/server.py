@@ -1,21 +1,32 @@
 """Local Web Chat Server connected to the deployed Healthcare Claims Agent on Vertex AI."""
 
-import ast
+from __future__ import annotations
+
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-import subprocess
-import time
+import sys
 import urllib.error
 import urllib.request
 
-PROJECT_ID = "arnbtest"
-LOCATION = "us-central1"
-ENGINE_ID = "6960836041880109056"
-PORT = int(os.environ.get("PORT", "8085"))
-
 WEB_DIR = os.path.dirname(os.path.abspath(__file__))
-MAIN_PY_PATH = os.path.join(os.path.dirname(WEB_DIR), "main.py")
+ROOT_DIR = os.path.dirname(WEB_DIR)
+if ROOT_DIR not in sys.path:
+  sys.path.insert(0, ROOT_DIR)
+
+from database import MOCK_CLAIMS, MOCK_MEMBERS, MOCK_PRIOR_AUTHS  # noqa: E402
+from observability import PiiPhiRedactor, log_structured_event  # noqa: E402
+from secrets_manager import secret_manager_service  # noqa: E402
+
+PROJECT_ID = secret_manager_service.get_secret(
+    "gcp-project-id", default=os.environ.get("GOOGLE_CLOUD_PROJECT", "arnbtest")
+)
+LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+ENGINE_ID = secret_manager_service.get_secret(
+    "reasoning-engine-id",
+    default=os.environ.get("REASONING_ENGINE_ID", "6960836041880109056"),
+)
+PORT = int(os.environ.get("PORT", "8085"))
 
 QUERY_URL = (
     f"https://{LOCATION}-aiplatform.googleapis.com/v1beta1/"
@@ -26,55 +37,13 @@ STREAM_URL = (
     f"projects/{PROJECT_ID}/locations/{LOCATION}/reasoningEngines/{ENGINE_ID}:streamQuery?alt=sse"
 )
 
-_TOKEN_CACHE = {"token": None, "expires_at": 0.0}
-_USER_SESSIONS = {}
+_USER_SESSIONS: dict[str, str] = {}
 
-
-def get_access_token(force_refresh: bool = False) -> str:
-  now = time.time()
-  if (
-      not force_refresh
-      and _TOKEN_CACHE["token"]
-      and now < _TOKEN_CACHE["expires_at"]
-  ):
-    return _TOKEN_CACHE["token"]
-  token = subprocess.check_output(
-      [
-          "/google/bin/releases/cloud-sdk-build/gcloud.par",
-          "auth",
-          "print-access-token",
-          f"--project={PROJECT_ID}",
-          "--quiet",
-      ],
-      text=True,
-  ).strip()
-  _TOKEN_CACHE["token"] = token
-  _TOKEN_CACHE["expires_at"] = now + 2400  # 40 minutes
-  return token
-
-
-def load_mock_data_from_main() -> dict:
-  with open(MAIN_PY_PATH, "r", encoding="utf-8") as f:
-    source = f.read()
-  tree = ast.parse(source)
-  extracted = {}
-  target_names = {
-      "MOCK_MEMBERS": "members",
-      "MOCK_CLAIMS": "claims",
-      "MOCK_PRIOR_AUTHS": "prior_auths",
-  }
-  for node in tree.body:
-    if isinstance(node, ast.Assign):
-      for target in node.targets:
-        if isinstance(target, ast.Name) and target.id in target_names:
-          extracted[target_names[target.id]] = ast.literal_eval(node.value)
-    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-      if node.target.id in target_names and node.value is not None:
-        extracted[target_names[node.target.id]] = ast.literal_eval(node.value)
-  return extracted
-
-
-MOCK_DATA = load_mock_data_from_main()
+MOCK_DATA = {
+    "members": MOCK_MEMBERS,
+    "claims": MOCK_CLAIMS,
+    "prior_auths": MOCK_PRIOR_AUTHS,
+}
 
 
 def ensure_session(user_id: str, token: str) -> str | None:
@@ -90,7 +59,7 @@ def ensure_session(user_id: str, token: str) -> str | None:
       headers={
           "Authorization": f"Bearer {token}",
           "Content-Type": "application/json",
-          "x-goog-user-project": PROJECT_ID,
+          "x-goog-user-project": str(PROJECT_ID),
       },
       method="POST",
   )
@@ -106,12 +75,15 @@ def ensure_session(user_id: str, token: str) -> str | None:
     return None
 
 
-def query_reasoning_engine(user_id: str, session_id: str | None, message: str) -> dict:
-  token = get_access_token()
+def query_reasoning_engine(
+    user_id: str, session_id: str | None, message: str
+) -> dict:
+  token = secret_manager_service.get_gcp_access_token()
   if not session_id:
     session_id = ensure_session(user_id, token)
 
-  input_obj = {"user_id": user_id, "message": message}
+  sanitized_message = PiiPhiRedactor.redact_text(message)
+  input_obj = {"user_id": user_id, "message": sanitized_message}
   if session_id:
     input_obj["session_id"] = session_id
 
@@ -126,7 +98,7 @@ def query_reasoning_engine(user_id: str, session_id: str | None, message: str) -
       headers={
           "Authorization": f"Bearer {token}",
           "Content-Type": "application/json",
-          "x-goog-user-project": PROJECT_ID,
+          "x-goog-user-project": str(PROJECT_ID),
       },
       method="POST",
   )
@@ -175,6 +147,13 @@ def query_reasoning_engine(user_id: str, session_id: str | None, message: str) -
       elif "text" in part and part["text"]:
         text_parts.append(part["text"])
 
+  log_structured_event(
+      "WEB_UI_QUERY_COMPLETED",
+      "Completed web chat query against Vertex AI Reasoning Engine.",
+      user_id=user_id,
+      session_id=session_id,
+      tools_called=[tc["name"] for tc in tool_calls_order],
+  )
   return {
       "reply": "\n\n".join(text_parts).strip(),
       "tool_calls": tool_calls_order,
@@ -249,7 +228,9 @@ class ChatServerHandler(BaseHTTPRequestHandler):
         self._send_json(200, result)
       except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
-        self._send_json(e.code, {"error": f"Vertex AI HTTP {e.code}: {err_body}"})
+        self._send_json(
+            e.code, {"error": f"Vertex AI HTTP {e.code}: {err_body}"}
+        )
       except Exception as e:
         self._send_json(500, {"error": str(e)})
     else:
@@ -257,18 +238,19 @@ class ChatServerHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-  # Pre-warm token cache on startup
   try:
-    get_access_token()
-    print("OAuth token pre-warmed for project arnbtest.", flush=True)
+    secret_manager_service.get_gcp_access_token()
+    log_structured_event(
+        "WEB_SERVER_STARTUP",
+        f"Healthcare Claims Agent Web UI listening on http://arnabtest.c.googlers.com:{PORT}",
+        port=PORT,
+        project_id=PROJECT_ID,
+        engine_id=ENGINE_ID,
+    )
   except Exception as e:
     print(f"Warning: token pre-warm failed: {e}", flush=True)
 
   server = ThreadingHTTPServer(("0.0.0.0", PORT), ChatServerHandler)
-  print(
-      f"Healthcare Claims Agent Web UI listening on http://arnabtest.c.googlers.com:{PORT}",
-      flush=True,
-  )
   server.serve_forever()
 
 

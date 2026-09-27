@@ -1,19 +1,42 @@
-# Healthcare Claims Agent (`google-adk` on Vertex AI Agent Engine)
+# Healthcare Claims Multi-Agent System (`google-adk` on Vertex AI Agent Engine)
 
-An end-to-end **Google Agent Development Kit (ADK)** agent (`gemini-2.5-flash`) deployed on **Vertex AI Agent Engine** (`reasoningEngines`) in Google Cloud project **`arnbtest`**, complete with realistic healthcare claims mock data, 6 adjudication & member service tools, and a standalone interactive web chat console.
+An enterprise-grade **Google Agent Development Kit (ADK)** multi-agent system deployed on **Vertex AI Agent Engine** (`reasoningEngines`) in Google Cloud project **`arnbtest`**, engineered for healthcare claims adjudication, member eligibility verification, clinical policy vector search, and Human-in-the-Loop (HITL) appeal workflows.
 
 ---
 
-## 1. Deployed GCP Resource Details
+## 1. Enterprise Architecture & Evaluation Pillars
 
-- **Project ID:** `arnbtest` (`projects/163474459793`)
-- **Region:** `us-central1`
-- **Reasoning Engine Resource:** `projects/163474459793/locations/us-central1/reasoningEngines/6960836041880109056`
-- **Agent Registry Resource:** `projects/arnbtest/locations/us-central1/agents/agentregistry-00000000-0000-0000-6002-f664f5cff1ee`
-- **Model:** `gemini-2.5-flash`
-- **Framework:** `google-adk` (`2.6.3`)
-- **GCP Console Playground URL:**
-  `https://console.cloud.google.com/vertex-ai/agents/agent-engines/locations/us-central1/agent-engines/6960836041880109056?project=arnbtest`
+### I. Tool & Interface Design (`schemas.py` & `main.py`)
+- **Strict Pydantic v2 Input & Output Schemas:** Every ADK tool validates incoming arguments against a `ConfigDict(extra="forbid")` Pydantic `BaseModel` (`MemberLookupRequest`, `ListClaimsRequest`, `ClaimDetailsRequest`, `PriorAuthLookupRequest`, `CostEstimateRequest`, `SubmitAppealRequest`, `PolicySearchRequest`) with regex patterns (`^MEM-\d{4}$`, `^CLM-\d{4}-\d{4}$`), numeric bounds (`gt=0.0`), and `@field_validator` normalizers.
+- **Constrained Output Envelopes:** All tools return explicit Pydantic response models (`MemberEligibilityResponse`, `MemberClaimsListResponse`, `ClaimDetailsResponse`, `PriorAuthLookupResponse`, `CostEstimateResponse`, `ClaimAppealResponse`, `PolicySearchResponse`) with actionable recovery hints on validation or lookup errors.
+
+### II. Context & Memory Management (`database.py` & `memory_manager.py`)
+- **Persistent Relational Database (SQLite WAL):** Stores normalized `members`, `claims`, `prior_authorizations`, `claim_appeals`, and `long_term_memories` tables with ACID transactions.
+- **Clinical Policy Vector Store (`clinical_policy_vectors`):** Indexes payer adjudication policies (`POL-CARC-197`, `POL-CARC-50-GENOMICS`) and CMS Local Coverage Determinations (`POL-LCD-L33965`, `POL-LCD-L34636`) with L2-normalized vector embeddings and cosine similarity retrieval (`search_clinical_policies_and_guidelines`).
+- **Context Bloat Management & Sliding-Window Compaction:** Combines ADK's `ContextFilterPlugin(num_invocations_to_keep=6)` with `ContextCompactionManager`, which enforces token/character budgets (`MAX_ESTIMATED_CONTEXT_TOKENS = 6000`) and compacts evicted conversation turns into `callback_context.state["compacted_session_memory"]`.
+- **Asynchronous Background Memory Operations:** `AsyncBackgroundMemoryWorker` uses `asyncio.create_task` and a background `ThreadPoolExecutor` to asynchronously extract and persist long-term clinical interaction facts after each turn without blocking the user response.
+
+### III. Multi-Agent Orchestration, Model Routing, & Guardrails (`main.py` & `guardrails.py`)
+- **Hierarchical Multi-Agent System & Strategic Model Routing:**
+  1. **`Healthcare_Claims_Agent` (Coordinator, `gemini-2.5-flash`)** — Triages requests, enforces global governance, and delegates to specialized sub-agents.
+  2. **`Eligibility_And_Benefits_Agent` (`gemini-2.5-flash`)** — Low-latency tier for member eligibility verification and out-of-pocket cost estimation.
+  3. **`Clinical_Denial_Analyst_Agent` (`gemini-2.5-pro`)** — High-reasoning tier for complex CPT/ICD-10 medical necessity analysis, CARC/RARC denial root-cause investigation, and clinical policy vector retrieval.
+  4. **`Appeals_And_Grievances_Specialist_Agent` (`gemini-2.5-pro`)** — Regulated adjudication specialist for formal claim appeals.
+- **Dynamic Complexity Router (`StrategicModelRouter`):** Inspects classified intents in `before_model_callback` to route complex clinical/appeal workflows to `gemini-2.5-pro` and routine lookups to `gemini-2.5-flash`.
+- **Security Guardrails (`HealthcareSecurityGuardrail` & `HealthcareGovernancePlugin`):** Blocks prompt injection, system prompt extraction, SQL injection, and bulk PHI exfiltration before reaching the model.
+- **Human-in-the-Loop (HITL) Confirmation Hooks:** Wraps `submit_claim_appeal` in `FunctionTool(..., require_confirmation=requires_appeal_hitl_confirmation)` and enforces `evaluate_hitl_gate` so high-dollar appeals ($\ge \$1,000$) require explicit human confirmation (`human_confirmed=True`).
+
+### IV. Observability, Tracing, & HIPAA Redaction (`observability.py`)
+- **OpenTelemetry Distributed Tracing:** Enabled on `AdkApp(enable_tracing=True)` with span enrichment (`gen_ai.intent.categories`, `gen_ai.outcome.status`, `gen_ai.outcome.goal_alignment_score`, `gen_ai.model.routed`).
+- **Cloud Logging Structured JSON Logs (`StructuredJsonFormatter`):** Emits single-line JSON records with `severity`, `timestamp`, `logging.googleapis.com/trace`, `logging.googleapis.com/spanId`, `event_type`, and `latency_ms`.
+- **Intent vs. Outcome Auditing (`IntentOutcomeTracker`):** Classifies user intent at turn start and logs a structured `INTENT_VS_OUTCOME_AUDIT` record comparing expected domain goals against actual tools invoked and outcome status.
+- **Deterministic PII/PHI Redaction (`PiiPhiRedactor`):** Scrubs SSNs (`[REDACTED-SSN]`), phone numbers, emails, payment cards, Medicare MBIs, and masks DOBs (`YYYY-**-** [REDACTED-DOB]`) across prompts, model outputs, and logs.
+
+### V. Infrastructure-as-Code, Secret Manager, & CI/CD (`terraform/`, `secrets_manager.py`, `evals/`, `.github/workflows/`)
+- **Terraform IaC (`terraform/`):** Provisions Google Cloud APIs, least-privilege Service Account & IAM bindings, Secret Manager secrets (`gcp-project-id`, `reasoning-engine-id`), and versioned GCS artifact staging bucket.
+- **Google Cloud Secret Manager & ADC (`secrets_manager.py`):** Retrieves secrets via `google.cloud.secretmanager.SecretManagerServiceClient` with TTL caching and authenticates via Application Default Credentials (`google.auth.default()`).
+- **Automated Golden Dataset Evaluation Suite (`evals/golden_dataset.json` & `evals/run_evaluation.py`):** Evaluates 8 golden healthcare scenarios across intent classification, model routing, Pydantic schema compliance, factual accuracy, HITL gating, and prompt-injection rejection (`100%` score gate in CI).
+- **GitHub Actions CI/CD Pipeline (`.github/workflows/ci_cd.yml`):** Runs unit tests, executes the Golden Dataset Evaluation Gate (`--min-score 0.95`), validates Terraform configurations, and deploys to Vertex AI Agent Engine via Workload Identity Federation.
 
 ---
 
@@ -21,54 +44,50 @@ An end-to-end **Google Agent Development Kit (ADK)** agent (`gemini-2.5-flash`) 
 
 ```text
 .
-├── main.py                # ADK Healthcare Claims Agent definition, 6 tools, and mock dataset
-├── requirements.txt       # Vertex AI Agent Engine runtime dependencies
-├── deploy_agent.py        # Source-based deployment script for Vertex AI Reasoning Engine
-├── test_agent.py          # Live SSE streaming verification client (:streamQuery)
-└── web_ui/                # Interactive Adjudication & Member Resolution Web Chat Console
-    ├── server.py          # Local HTTP server & Vertex AI Reasoning Engine proxy
-    ├── index.html         # Web console layout & interactive mock directory
-    ├── styles.css         # Clinical styling & responsive layout
-    └── app.js             # Chat logic, live ADK tool trace inspector, and session state
+├── main.py                        # Multi-agent ADK definitions, 7 schema-validated tools, AdkApp
+├── schemas.py                     # Strict Pydantic v2 input/output & domain JSON schemas
+├── database.py                    # Persistent SQLite relational store & Clinical Policy Vector Store
+├── memory_manager.py              # Sliding-window context compaction & async background memory worker
+├── guardrails.py                  # Security guardrails, StrategicModelRouter, HITL gate, & ADK BasePlugin
+├── observability.py               # Structured JSON logger, PII/PHI redactor, & Intent-vs-Outcome tracker
+├── secrets_manager.py             # Google Cloud Secret Manager & ADC integration
+├── deploy_agent.py                # Source-based Vertex AI Reasoning Engine deployment script
+├── test_agent.py                  # Live SSE streaming verification client (:streamQuery)
+├── requirements.txt               # Runtime dependencies
+├── evals/
+│   ├── golden_dataset.json        # 8 golden benchmark scenarios & expected tool trajectories
+│   └── run_evaluation.py          # Automated evaluation runner & CI quality gate
+├── tests/
+│   └── test_agent_suite.py        # Unit & integration test suite
+├── terraform/
+│   ├── versions.tf                # Terraform & Google provider constraints
+│   ├── variables.tf               # Input variables for project, region, and engine ID
+│   ├── main.tf                    # APIs, Service Account IAM, Secret Manager, and GCS staging
+│   └── outputs.tf                 # Provisioned infrastructure outputs
+├── .github/workflows/
+│   └── ci_cd.yml                  # Automated test, golden eval, Terraform validate, & WIF deploy pipeline
+└── web_ui/                        # Interactive Adjudication & Member Resolution Web Chat Console
+    ├── server.py
+    ├── index.html
+    ├── styles.css
+    └── app.js
 ```
 
 ---
 
-## 3. ADK Tools & Mock Dataset
+## 3. Running Tests, Golden Evaluations, & Web Console
 
-### ADK Tools (`main.py`)
-1. `get_member_eligibility(member_id_or_name)` — Look up member coverage status, plan details, deductible/OOP max accumulators, coinsurance, and copays.
-2. `list_member_claims(member_id, status_filter="ALL")` — List claims for a member filtered by status (`ALL`, `PAID`, `DENIED`, `PENDING_REVIEW`).
-3. `get_claim_details(claim_id)` — Inspect full CPT/ICD-10 line-item adjudication, CARC/RARC denial codes, EOB numbers, and appeal deadlines.
-4. `check_prior_authorization(member_id="", pa_id="")` — Check prior authorization status, approved CPT codes, and approved provider NPIs.
-5. `estimate_patient_responsibility(member_id, cpt_code, estimated_allowed_amount, in_network=True)` — Calculate estimated patient out-of-pocket cost based on remaining deductible, coinsurance, and out-of-pocket maximum.
-6. `submit_claim_appeal(claim_id, appeal_reason, supporting_reference="")` — Submit a formal claim appeal for a denied claim and generate a tracking ID.
-
-### Mock Members & Claims
-| Member ID | Name | Plan | Status | Claims | Prior Authorizations |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| `MEM-1001` | **Sarah Jenkins** | Gold PPO Plus | `ACTIVE` | `CLM-2026-9001` (`PAID`)<br>`CLM-2026-9002` (`DENIED` `CO-197`) | `PA-2026-441` (`APPROVED` for CPT `29881`) |
-| `MEM-1002` | **Michael Chen** | Silver HMO Select | `ACTIVE` | `CLM-2026-9003` (`PAID`)<br>`CLM-2026-9004` (`PENDING_REVIEW`) | `PA-2026-512` (`PENDING_CLINICAL_REVIEW` for CPT `71250`) |
-| `MEM-1003` | **Elena Rodriguez** | Platinum EPO Premier | `ACTIVE` | `CLM-2026-9005` (`DENIED` `CO-50`) | — |
-| `MEM-1004` | **David Ross** | Bronze HDHP HSA | `INACTIVE` | — | — |
-
----
-
-## 4. Running & Testing
-
-### Test the Deployed Agent via CLI
+### Run Unit & Integration Tests
 ```bash
-python3 test_agent.py
+python3 -m unittest discover -s tests -p "test_*.py" -v
+```
+
+### Run the Golden Dataset Evaluation Suite
+```bash
+python3 evals/run_evaluation.py --min-score 0.95
 ```
 
 ### Launch the Interactive Web Chat Console
 ```bash
 python3 web_ui/server.py
-```
-Then open `http://localhost:8085` (or `http://arnabtest.c.googlers.com:8085` on Cloudtop).
-
-### Re-deploy to Vertex AI Agent Engine
-```bash
-tar -czf source.tar.gz main.py requirements.txt
-python3 deploy_agent.py
 ```

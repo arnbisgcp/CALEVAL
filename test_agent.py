@@ -1,34 +1,31 @@
-"""Test the deployed Healthcare Claims ADK Agent on Vertex AI Agent Engine."""
+"""Live Streaming Verification Client for the Deployed Healthcare Claims ADK Agent."""
+
+from __future__ import annotations
 
 import json
-import subprocess
+import os
 import urllib.error
 import urllib.request
 
-PROJECT_ID = "arnbtest"
-LOCATION = "us-central1"
-ENGINE_ID = "6960836041880109056"
+from observability import log_structured_event
+from secrets_manager import secret_manager_service
+
+PROJECT_ID = secret_manager_service.get_secret(
+    "gcp-project-id", default=os.environ.get("GOOGLE_CLOUD_PROJECT", "arnbtest")
+)
+LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+ENGINE_ID = secret_manager_service.get_secret(
+    "reasoning-engine-id",
+    default=os.environ.get("REASONING_ENGINE_ID", "6960836041880109056"),
+)
 STREAM_URL = (
     f"https://{LOCATION}-aiplatform.googleapis.com/v1beta1/"
     f"projects/{PROJECT_ID}/locations/{LOCATION}/reasoningEngines/{ENGINE_ID}:streamQuery?alt=sse"
 )
 
 
-def get_token() -> str:
-  return subprocess.check_output(
-      [
-          "/google/bin/releases/cloud-sdk-build/gcloud.par",
-          "auth",
-          "print-access-token",
-          f"--project={PROJECT_ID}",
-          "--quiet",
-      ],
-      text=True,
-  ).strip()
-
-
 def main() -> None:
-  token = get_token()
+  token = secret_manager_service.get_gcp_access_token()
   payload = {
       "class_method": "stream_query",
       "input": {
@@ -46,12 +43,16 @@ def main() -> None:
       headers={
           "Authorization": f"Bearer {token}",
           "Content-Type": "application/json",
-          "x-goog-user-project": PROJECT_ID,
+          "x-goog-user-project": str(PROJECT_ID),
       },
       method="POST",
   )
 
-  print(f"Sending query to {STREAM_URL}...\n", flush=True)
+  log_structured_event(
+      "LIVE_AGENT_TEST_START",
+      f"Sending streaming verification query to {STREAM_URL}",
+      engine_id=ENGINE_ID,
+  )
   try:
     with urllib.request.urlopen(req, timeout=60) as resp:
       raw = resp.read().decode("utf-8")

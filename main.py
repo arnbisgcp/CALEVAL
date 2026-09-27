@@ -1,680 +1,612 @@
-"""Healthcare Claims ADK Agent deployed on Vertex AI Agent Engine."""
+"""Healthcare Claims Multi-Agent System built with Google ADK for Vertex AI Agent Engine.
 
+Architecture highlights:
+- Strict Pydantic v2 input/output JSON schemas (`schemas.py`)
+- Persistent SQLite relational store & Clinical Policy Vector Store (`database.py`)
+- Sliding-window context compaction & async background memory consolidation (`memory_manager.py`)
+- Hierarchical multi-agent orchestration (`gemini-2.5-flash` + `gemini-2.5-pro` strategic routing)
+- Security guardrails, PII/PHI redaction, and Human-in-the-Loop (HITL) confirmation hooks (`guardrails.py`)
+- Cloud Logging structured JSON telemetry & Intent-vs-Outcome auditing (`observability.py`)
+- Google Cloud Secret Manager & ADC integration (`secrets_manager.py`)
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
 import os
-from typing import Any
-from google.adk.agents import llm_agent
-import vertexai
-from vertexai.preview.reasoning_engines import AdkApp
+import uuid
 
-# Ensure Vertex AI global config is initialized before constructing AdkApp
-PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "arnbtest")
-LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-vertexai.init(project=PROJECT_ID, location=LOCATION)
+from database import (
+    MOCK_CLAIMS,
+    MOCK_MEMBERS,
+    MOCK_PRIOR_AUTHS,
+    repository,
+)
+from guardrails import (
+    HealthcareGovernancePlugin,
+    evaluate_hitl_gate,
+    requires_appeal_hitl_confirmation,
+)
+from observability import log_structured_event
+from schemas import (
+    AppealRecord,
+    AppealStatus,
+    ClaimAppealResponse,
+    ClaimDetailsRequest,
+    ClaimDetailsResponse,
+    ClaimSummaryItem,
+    CostEstimateBreakdown,
+    CostEstimateRequest,
+    CostEstimateResponse,
+    ListClaimsRequest,
+    MemberClaimsListResponse,
+    MemberEligibilityResponse,
+    MemberLookupRequest,
+    NetworkStatus,
+    PlanStatus,
+    PolicySearchRequest,
+    PolicySearchResponse,
+    PriorAuthLookupRequest,
+    PriorAuthLookupResponse,
+    SubmitAppealRequest,
+    ValidationError,
+)
+from secrets_manager import secret_manager_service
 
-# ==============================================================================
-# Mock Healthcare Claims Database
-# ==============================================================================
-
-MOCK_MEMBERS: dict[str, dict[str, Any]] = {
-    "MEM-1001": {
-        "member_id": "MEM-1001",
-        "full_name": "Sarah Jenkins",
-        "dob": "1985-04-12",
-        "plan_name": "Gold PPO Plus",
-        "group_number": "GRP-88420",
-        "status": "ACTIVE",
-        "effective_date": "2026-01-01",
-        "deductible_individual": 1500.00,
-        "deductible_met": 1200.00,
-        "oop_max_individual": 5000.00,
-        "oop_max_met": 2150.00,
-        "coinsurance_in_network": 0.20,
-        "coinsurance_out_of_network": 0.40,
-        "copays": {
-            "pcp": 20.00,
-            "specialist": 40.00,
-            "urgent_care": 50.00,
-            "emergency_room": 250.00,
-        },
-    },
-    "MEM-1002": {
-        "member_id": "MEM-1002",
-        "full_name": "Michael Chen",
-        "dob": "1978-11-03",
-        "plan_name": "Silver HMO Standard",
-        "group_number": "GRP-44110",
-        "status": "ACTIVE",
-        "effective_date": "2026-01-01",
-        "deductible_individual": 3000.00,
-        "deductible_met": 650.00,
-        "oop_max_individual": 7500.00,
-        "oop_max_met": 980.00,
-        "coinsurance_in_network": 0.30,
-        "coinsurance_out_of_network": 1.00,  # HMO does not cover OON non-emergency
-        "copays": {
-            "pcp": 30.00,
-            "specialist": 60.00,
-            "urgent_care": 75.00,
-            "emergency_room": 350.00,
-        },
-    },
-    "MEM-1003": {
-        "member_id": "MEM-1003",
-        "full_name": "Elena Rodriguez",
-        "dob": "1992-07-22",
-        "plan_name": "Platinum EPO Premier",
-        "group_number": "GRP-99201",
-        "status": "ACTIVE",
-        "effective_date": "2026-01-01",
-        "deductible_individual": 500.00,
-        "deductible_met": 500.00,
-        "oop_max_individual": 2500.00,
-        "oop_max_met": 1420.00,
-        "coinsurance_in_network": 0.10,
-        "coinsurance_out_of_network": 1.00,
-        "copays": {
-            "pcp": 10.00,
-            "specialist": 25.00,
-            "urgent_care": 25.00,
-            "emergency_room": 150.00,
-        },
-    },
-    "MEM-1004": {
-        "member_id": "MEM-1004",
-        "full_name": "David Ross",
-        "dob": "1964-01-19",
-        "plan_name": "Bronze HDHP HSA",
-        "group_number": "GRP-12009",
-        "status": "INACTIVE",
-        "effective_date": "2025-01-01",
-        "termination_date": "2026-06-30",
-        "deductible_individual": 6000.00,
-        "deductible_met": 1800.00,
-        "oop_max_individual": 8000.00,
-        "oop_max_met": 1800.00,
-        "coinsurance_in_network": 0.20,
-        "coinsurance_out_of_network": 0.50,
-        "copays": {},
-    },
-}
-
-MOCK_CLAIMS: dict[str, dict[str, Any]] = {
-    "CLM-2026-9001": {
-        "claim_id": "CLM-2026-9001",
-        "member_id": "MEM-1001",
-        "patient_name": "Sarah Jenkins",
-        "service_date": "2026-08-14",
-        "received_date": "2026-08-16",
-        "processed_date": "2026-08-21",
-        "provider_name": "Pacific Orthopedic Associates",
-        "provider_npi": "NPI-1234567890",
-        "network_status": "IN_NETWORK",
-        "diagnosis_codes": [
-            {
-                "icd10": "M23.211",
-                "description": (
-                    "Derangement of anterior horn of medial meniscus, right"
-                    " knee"
-                ),
-            }
-        ],
-        "line_items": [
-            {
-                "cpt": "99214",
-                "description": "Office/outpatient visit, established patient",
-                "billed": 220.00,
-                "allowed": 140.00,
-                "plan_paid": 100.00,
-                "patient_resp": 40.00,
-                "notes": "Specialist copay ($40.00)",
-            },
-            {
-                "cpt": "73721",
-                "description": (
-                    "MRI lower extremity joint (right knee) without contrast"
-                ),
-                "billed": 1450.00,
-                "allowed": 980.00,
-                "plan_paid": 764.00,
-                "patient_resp": 216.00,
-                "notes": "Deductible satisfied; 20% coinsurance applied",
-            },
-        ],
-        "total_billed": 1670.00,
-        "total_allowed": 1120.00,
-        "total_plan_paid": 864.00,
-        "total_patient_responsibility": 256.00,
-        "status": "PAID",
-        "eob_number": "EOB-88412",
-        "denial_code": None,
-        "denial_reason": None,
-        "appeal_eligible": False,
-    },
-    "CLM-2026-9002": {
-        "claim_id": "CLM-2026-9002",
-        "member_id": "MEM-1001",
-        "patient_name": "Sarah Jenkins",
-        "service_date": "2026-09-02",
-        "received_date": "2026-09-04",
-        "processed_date": "2026-09-09",
-        "provider_name": "Bay Area Surgical Center",
-        "provider_npi": "NPI-1987654321",
-        "network_status": "IN_NETWORK",
-        "diagnosis_codes": [
-            {
-                "icd10": "M23.211",
-                "description": (
-                    "Derangement of anterior horn of medial meniscus, right"
-                    " knee"
-                ),
-            }
-        ],
-        "line_items": [
-            {
-                "cpt": "29881",
-                "description": (
-                    "Arthroscopy, knee, surgical; with meniscectomy (medial OR"
-                    " lateral)"
-                ),
-                "billed": 4800.00,
-                "allowed": 3200.00,
-                "plan_paid": 0.00,
-                "patient_resp": 4800.00,
-                "notes": "Denied: CO-197 Precertification/authorization absent",
-            }
-        ],
-        "total_billed": 4800.00,
-        "total_allowed": 3200.00,
-        "total_plan_paid": 0.00,
-        "total_patient_responsibility": 4800.00,
-        "status": "DENIED",
-        "eob_number": "EOB-89205",
-        "denial_code": "CO-197",
-        "denial_reason": (
-            "Precertification/authorization/notification absent. Note: Prior"
-            " Authorization PA-2026-441 was approved for CPT 29881 under"
-            " Pacific Orthopedic Associates (NPI-1234567890), but claim was"
-            " billed under surgical facility NPI-1987654321."
-        ),
-        "appeal_eligible": True,
-        "appeal_deadline": "2027-03-01",
-    },
-    "CLM-2026-9003": {
-        "claim_id": "CLM-2026-9003",
-        "member_id": "MEM-1002",
-        "patient_name": "Michael Chen",
-        "service_date": "2026-09-10",
-        "received_date": "2026-09-11",
-        "processed_date": "2026-09-15",
-        "provider_name": "Metro Urgent Care Clinic",
-        "provider_npi": "NPI-1122334455",
-        "network_status": "IN_NETWORK",
-        "diagnosis_codes": [
-            {"icd10": "J02.9", "description": "Acute pharyngitis, unspecified"}
-        ],
-        "line_items": [
-            {
-                "cpt": "99203",
-                "description": "Urgent care / office visit, new patient",
-                "billed": 185.00,
-                "allowed": 125.00,
-                "plan_paid": 50.00,
-                "patient_resp": 75.00,
-                "notes": "Urgent care copay ($75.00)",
-            },
-            {
-                "cpt": "87880",
-                "description": "Strep A assay with optic readout",
-                "billed": 45.00,
-                "allowed": 35.00,
-                "plan_paid": 35.00,
-                "patient_resp": 0.00,
-                "notes": "Bundled diagnostic lab covered at 100%",
-            },
-        ],
-        "total_billed": 230.00,
-        "total_allowed": 160.00,
-        "total_plan_paid": 85.00,
-        "total_patient_responsibility": 75.00,
-        "status": "PAID",
-        "eob_number": "EOB-90104",
-        "denial_code": None,
-        "denial_reason": None,
-        "appeal_eligible": False,
-    },
-    "CLM-2026-9004": {
-        "claim_id": "CLM-2026-9004",
-        "member_id": "MEM-1002",
-        "patient_name": "Michael Chen",
-        "service_date": "2026-09-18",
-        "received_date": "2026-09-19",
-        "processed_date": "2026-09-23",
-        "provider_name": "Apex Cardiology Group",
-        "provider_npi": "NPI-1556677889",
-        "network_status": "OUT_OF_NETWORK",
-        "diagnosis_codes": [{"icd10": "R00.2", "description": "Palpitations"}],
-        "line_items": [
-            {
-                "cpt": "93306",
-                "description": (
-                    "Echocardiography, transthoracic, real-time with image"
-                    " documentation (2D), complete"
-                ),
-                "billed": 1950.00,
-                "allowed": 0.00,
-                "plan_paid": 0.00,
-                "patient_resp": 1950.00,
-                "notes": "Denied: Out-of-network provider on HMO plan",
-            }
-        ],
-        "total_billed": 1950.00,
-        "total_allowed": 0.00,
-        "total_plan_paid": 0.00,
-        "total_patient_responsibility": 1950.00,
-        "status": "DENIED",
-        "eob_number": "EOB-90881",
-        "denial_code": "CO-242",
-        "denial_reason": (
-            "Services not provided by network/primary care providers. Silver"
-            " HMO Standard requires an approved out-of-network referral waiver"
-            " for non-emergency specialist services."
-        ),
-        "appeal_eligible": True,
-        "appeal_deadline": "2027-03-17",
-    },
-    "CLM-2026-9005": {
-        "claim_id": "CLM-2026-9005",
-        "member_id": "MEM-1003",
-        "patient_name": "Elena Rodriguez",
-        "service_date": "2026-09-20",
-        "received_date": "2026-09-21",
-        "processed_date": None,
-        "provider_name": "Golden Gate Women's Health",
-        "provider_npi": "NPI-1443322110",
-        "network_status": "IN_NETWORK",
-        "diagnosis_codes": [
-            {
-                "icd10": "Z00.00",
-                "description": (
-                    "Encounter for general adult medical examination without"
-                    " abnormal findings"
-                ),
-            }
-        ],
-        "line_items": [
-            {
-                "cpt": "99213",
-                "description": "Office/outpatient visit, established patient",
-                "billed": 160.00,
-                "allowed": 120.00,
-                "plan_paid": 0.00,
-                "patient_resp": 0.00,
-                "notes": (
-                    "Pending adjudication (Preventive wellness visit covered"
-                    " 100%)"
-                ),
-            },
-            {
-                "cpt": "80053",
-                "description": "Comprehensive metabolic panel",
-                "billed": 95.00,
-                "allowed": 70.00,
-                "plan_paid": 0.00,
-                "patient_resp": 0.00,
-                "notes": "Pending adjudication",
-            },
-        ],
-        "total_billed": 255.00,
-        "total_allowed": 190.00,
-        "total_plan_paid": 0.00,
-        "total_patient_responsibility": 0.00,
-        "status": "PENDING_REVIEW",
-        "eob_number": None,
-        "denial_code": None,
-        "denial_reason": None,
-        "appeal_eligible": False,
-        "estimated_completion_date": "2026-09-28",
-    },
-}
-
-MOCK_PRIOR_AUTHS: dict[str, dict[str, Any]] = {
-    "PA-2026-441": {
-        "pa_id": "PA-2026-441",
-        "member_id": "MEM-1001",
-        "patient_name": "Sarah Jenkins",
-        "cpt_code": "29881",
-        "procedure_description": "Arthroscopy, knee, surgical; with meniscectomy",
-        "status": "APPROVED",
-        "approved_provider": "Pacific Orthopedic Associates",
-        "approved_npi": "NPI-1234567890",
-        "valid_from": "2026-08-25",
-        "valid_to": "2026-11-25",
-        "notes": (
-            "Approved for 1 surgical procedure. Facility NPI can be updated to"
-            " Bay Area Surgical Center (NPI-1987654321) via claim appeal or"
-            " retro-auth request."
-        ),
-    },
-    "PA-2026-512": {
-        "pa_id": "PA-2026-512",
-        "member_id": "MEM-1003",
-        "patient_name": "Elena Rodriguez",
-        "cpt_code": "70553",
-        "procedure_description": "MRI Brain with and without contrast",
-        "status": "PENDING_CLINICAL_INFO",
-        "approved_provider": "UCSF Imaging Center",
-        "approved_npi": "NPI-1778899001",
-        "valid_from": None,
-        "valid_to": None,
-        "notes": (
-            "Awaiting clinical documentation showing 4 weeks of conservative"
-            " management from ordering physician."
-        ),
-    },
-}
+try:
+  from google.adk.agents import llm_agent
+  from google.adk.plugins.context_filter_plugin import ContextFilterPlugin
+  from google.adk.tools.function_tool import FunctionTool
+  import vertexai
+  from vertexai.agent_engines import AdkApp
+except ImportError:  # pragma: no cover
+  llm_agent = None  # type: ignore[assignment]
+  ContextFilterPlugin = None  # type: ignore[assignment]
+  FunctionTool = None  # type: ignore[assignment]
+  vertexai = None  # type: ignore[assignment]
+  AdkApp = None  # type: ignore[assignment]
 
 
-# ==============================================================================
-# ADK Tool Definitions
-# ==============================================================================
+# ============================================================================
+# Schema-Validated ADK Tools (Backed by Persistent SQLite & Vector Store)
+# ============================================================================
 
 
-def get_member_eligibility(member_id_or_name: str) -> dict[str, Any]:
-  """Look up a member's insurance eligibility, plan benefits, deductible, and out-of-pocket maximums.
+def get_member_eligibility(
+    member_id_or_name: str,
+) -> MemberEligibilityResponse:
+  """Looks up a member's insurance plan eligibility, coverage status, deductibles, and out-of-pocket accumulators.
 
   Args:
-    member_id_or_name: The member ID (e.g. 'MEM-1001') or full/partial name
-      (e.g. 'Sarah Jenkins').
+    member_id_or_name: The member ID (e.g., 'MEM-1001') or full/partial patient
+      name (e.g., 'Sarah Jenkins').
 
   Returns:
-    A dictionary containing member eligibility and benefit accumulation details.
+    A strictly typed `MemberEligibilityResponse` Pydantic model containing member
+    plan details, deductibles, and copay schedules, or guided recovery hints.
   """
-  query = member_id_or_name.strip().upper()
-  if query in MOCK_MEMBERS:
-    return {"found": True, "member": MOCK_MEMBERS[query]}
+  try:
+    req = MemberLookupRequest(member_id_or_name=member_id_or_name)
+  except ValidationError as exc:
+    return MemberEligibilityResponse(
+        found=False,
+        error=f"Invalid member lookup parameter: {exc}",
+        available_member_ids=repository.list_all_member_ids(),
+    )
 
-  matches = [
-      m
-      for m in MOCK_MEMBERS.values()
-      if member_id_or_name.strip().lower() in m["full_name"].lower()
-  ]
-  if matches:
-    return {"found": True, "member": matches[0]}
+  member = repository.find_member(req.member_id_or_name)
+  if member is not None:
+    return MemberEligibilityResponse(found=True, member=member)
 
-  return {
-      "found": False,
-      "error": f"No member found matching '{member_id_or_name}'.",
-      "available_members": [
-          {"member_id": k, "full_name": v["full_name"], "plan": v["plan_name"]}
-          for k, v in MOCK_MEMBERS.items()
-      ],
-  }
+  return MemberEligibilityResponse(
+      found=False,
+      error=f"No member found matching '{req.member_id_or_name}'.",
+      available_member_ids=repository.list_all_member_ids(),
+  )
 
 
 def list_member_claims(
-    member_id: str, status_filter: str = ""
-) -> dict[str, Any]:
-  """List healthcare claims for a given member ID, optionally filtered by claim status.
+    member_id: str,
+    status_filter: str = "ALL",
+) -> MemberClaimsListResponse:
+  """Lists healthcare claims for a specific member from the persistent SQLite claims database.
 
   Args:
-    member_id: The member ID (e.g. 'MEM-1001', 'MEM-1002', 'MEM-1003'). If
-      'ALL' is passed, returns all mock claims across all members.
-    status_filter: Optional claim status filter such as 'PAID', 'DENIED', or
-      'PENDING_REVIEW'. Leave empty for all statuses.
+    member_id: The member ID (e.g., 'MEM-1001').
+    status_filter: Optional status filter ('ALL', 'PAID', 'DENIED',
+      'PENDING_REVIEW', or 'APPEALED'). Defaults to 'ALL'.
 
   Returns:
-    A dictionary with matching claim summaries.
+    A strictly typed `MemberClaimsListResponse` Pydantic model with matching
+    claim summaries.
   """
-  mid = member_id.strip().upper()
-  status_norm = status_filter.strip().upper()
+  try:
+    req = ListClaimsRequest(member_id=member_id, status_filter=status_filter)
+  except ValidationError as exc:
+    return MemberClaimsListResponse(
+        member_id=member_id,
+        status_filter=status_filter,
+        count=0,
+        error=(
+            f"Validation error: {exc}. Valid member IDs: "
+            f"{repository.list_all_member_ids()}"
+        ),
+    )
 
-  claims = [
-      c
-      for c in MOCK_CLAIMS.values()
-      if (mid == "ALL" or c["member_id"] == mid)
-      and (not status_norm or c["status"] == status_norm)
+  member = repository.find_member(req.member_id)
+  if member is None:
+    return MemberClaimsListResponse(
+        member_id=req.member_id,
+        status_filter=req.status_filter.value,
+        count=0,
+        error=(
+            f"Member ID '{req.member_id}' not found. Valid member IDs: "
+            f"{repository.list_all_member_ids()}"
+        ),
+    )
+
+  records = repository.get_claims_for_member(
+      req.member_id, req.status_filter.value
+  )
+  summaries = [
+      ClaimSummaryItem(
+          claim_id=c.claim_id,
+          member_id=c.member_id,
+          patient_name=c.patient_name,
+          service_date=c.service_date,
+          provider_name=c.provider_name,
+          total_billed=c.total_billed,
+          total_plan_paid=c.total_plan_paid,
+          total_patient_responsibility=c.total_patient_responsibility,
+          status=c.status,
+          denial_code=c.denial_code,
+      )
+      for c in records
   ]
-  return {
-      "member_id": mid,
-      "status_filter": status_norm or "ALL",
-      "count": len(claims),
-      "claims": [
-          {
-              "claim_id": c["claim_id"],
-              "member_id": c["member_id"],
-              "patient_name": c["patient_name"],
-              "service_date": c["service_date"],
-              "provider_name": c["provider_name"],
-              "total_billed": c["total_billed"],
-              "total_plan_paid": c["total_plan_paid"],
-              "total_patient_responsibility": c["total_patient_responsibility"],
-              "status": c["status"],
-              "denial_code": c["denial_code"],
-          }
-          for c in claims
-      ],
-  }
+  return MemberClaimsListResponse(
+      member_id=req.member_id,
+      status_filter=req.status_filter.value,
+      count=len(summaries),
+      claims=summaries,
+  )
 
 
-def get_claim_details(claim_id: str) -> dict[str, Any]:
-  """Retrieve full adjudication details, CPT line items, ICD-10 diagnosis codes, and denial reasons for a specific claim.
+def get_claim_details(claim_id: str) -> ClaimDetailsResponse:
+  """Retrieves full line-item adjudication details, CPT/ICD-10 codes, EOB, and denial reasons for a claim.
 
   Args:
-    claim_id: The claim identifier (e.g. 'CLM-2026-9001', 'CLM-2026-9002').
+    claim_id: The claim ID (e.g., 'CLM-2026-9002').
 
   Returns:
-    Detailed claim information dictionary.
+    A strictly typed `ClaimDetailsResponse` Pydantic model containing the full
+    claim record or actionable recovery hints.
   """
-  cid = claim_id.strip().upper()
-  if cid in MOCK_CLAIMS:
-    return {"found": True, "claim": MOCK_CLAIMS[cid]}
-  return {
-      "found": False,
-      "error": f"Claim '{claim_id}' not found.",
-      "available_claim_ids": list(MOCK_CLAIMS.keys()),
-  }
+  try:
+    req = ClaimDetailsRequest(claim_id=claim_id)
+  except ValidationError as exc:
+    return ClaimDetailsResponse(
+        found=False,
+        error=f"Invalid claim_id format: {exc}",
+        available_claim_ids=repository.list_all_claim_ids(),
+    )
+
+  claim = repository.get_claim(req.claim_id)
+  if claim is None:
+    return ClaimDetailsResponse(
+        found=False,
+        error=f"Claim '{req.claim_id}' not found.",
+        available_claim_ids=repository.list_all_claim_ids(),
+    )
+
+  return ClaimDetailsResponse(found=True, claim=claim)
 
 
 def check_prior_authorization(
-    member_id: str = "", pa_id: str = ""
-) -> dict[str, Any]:
-  """Look up prior authorization (PA) records by PA ID or Member ID.
+    member_id: str = "",
+    pa_id: str = "",
+) -> PriorAuthLookupResponse:
+  """Checks prior authorization records by Member ID or Prior Authorization ID.
 
   Args:
-    member_id: Optional member ID (e.g. 'MEM-1001').
-    pa_id: Optional prior authorization ID (e.g. 'PA-2026-441').
+    member_id: Optional Member ID (e.g., 'MEM-1001') to list all prior
+      authorizations for that member.
+    pa_id: Optional Prior Authorization ID (e.g., 'PA-2026-441').
 
   Returns:
-    Matching prior authorization records.
+    A strictly typed `PriorAuthLookupResponse` Pydantic model containing matching
+    prior authorization records.
   """
-  pid = pa_id.strip().upper()
-  mid = member_id.strip().upper()
-
-  if pid and pid in MOCK_PRIOR_AUTHS:
-    return {"found": True, "prior_authorizations": [MOCK_PRIOR_AUTHS[pid]]}
-
-  results = [
-      pa
-      for pa in MOCK_PRIOR_AUTHS.values()
-      if (not mid or pa["member_id"] == mid)
-  ]
-  return {
-      "found": bool(results),
-      "count": len(results),
-      "prior_authorizations": results,
-  }
+  req = PriorAuthLookupRequest(member_id=member_id, pa_id=pa_id)
+  matches = repository.query_prior_authorizations(
+      member_id=req.member_id, pa_id=req.pa_id
+  )
+  if not matches:
+    return PriorAuthLookupResponse(
+        found=False,
+        count=0,
+        prior_authorizations=[],
+        message="No matching prior authorization records found.",
+    )
+  return PriorAuthLookupResponse(
+      found=True,
+      count=len(matches),
+      prior_authorizations=matches,
+  )
 
 
 def estimate_patient_responsibility(
     member_id: str,
     cpt_code: str,
-    billed_amount: float,
+    estimated_allowed_amount: float,
     in_network: bool = True,
-) -> dict[str, Any]:
-  """Calculate estimated allowed amount, deductible application, coinsurance, and patient responsibility for a procedure.
+) -> CostEstimateResponse:
+  """Calculates estimated patient out-of-pocket cost for a planned medical procedure.
 
   Args:
-    member_id: The member ID (e.g. 'MEM-1001').
-    cpt_code: The CPT procedure code (e.g. '29881', '73721', '99214').
-    billed_amount: Provider billed amount in USD.
+    member_id: The member ID (e.g., 'MEM-1001').
+    cpt_code: The 5-character CPT procedure code (e.g., '29881').
+    estimated_allowed_amount: The negotiated allowed amount for the procedure in
+      USD.
     in_network: True if the provider is in-network, False if out-of-network.
 
   Returns:
-    Cost breakdown estimate for the member.
+    A strictly typed `CostEstimateResponse` Pydantic model with deductible,
+    coinsurance, and out-of-pocket max calculations.
   """
-  mid = member_id.strip().upper()
-  if mid not in MOCK_MEMBERS:
-    return {"error": f"Member '{member_id}' not found."}
+  try:
+    req = CostEstimateRequest(
+        member_id=member_id,
+        cpt_code=cpt_code,
+        estimated_allowed_amount=estimated_allowed_amount,
+        in_network=in_network,
+    )
+  except ValidationError as exc:
+    return CostEstimateResponse(
+        eligible=False,
+        member_id=member_id,
+        cpt_code=cpt_code,
+        error=f"Invalid cost estimation parameters: {exc}",
+    )
 
-  member = MOCK_MEMBERS[mid]
-  if member["status"] != "ACTIVE":
-    return {
-        "member_id": mid,
-        "status": member["status"],
-        "estimated_plan_paid": 0.0,
-        "estimated_patient_responsibility": billed_amount,
-        "note": "Member coverage is INACTIVE; plan pays $0.00.",
-    }
-
-  if not in_network and member["coinsurance_out_of_network"] >= 1.0:
-    return {
-        "member_id": mid,
-        "plan_name": member["plan_name"],
-        "in_network": False,
-        "estimated_allowed_amount": 0.0,
-        "estimated_plan_paid": 0.0,
-        "estimated_patient_responsibility": billed_amount,
-        "note": (
-            f"{member['plan_name']} does not cover out-of-network non-emergency"
-            " services."
+  member = repository.find_member(req.member_id)
+  if member is None:
+    return CostEstimateResponse(
+        eligible=False,
+        member_id=req.member_id,
+        cpt_code=req.cpt_code,
+        error=(
+            f"Member '{req.member_id}' not found. Valid member IDs: "
+            f"{repository.list_all_member_ids()}"
         ),
-    }
+    )
 
-  # Standard mock fee schedule discount: 70% of billed for in-network
-  allowed = round(billed_amount * (0.70 if in_network else 0.50), 2)
+  if member.status != PlanStatus.ACTIVE:
+    return CostEstimateResponse(
+        eligible=False,
+        member_id=req.member_id,
+        patient_name=member.full_name,
+        plan_name=member.plan_name,
+        cpt_code=req.cpt_code,
+        error=(
+            f"Member '{req.member_id}' ({member.full_name}) has plan status "
+            f"'{member.status.value}'. Active coverage is required."
+        ),
+    )
+
   remaining_deductible = max(
-      0.0, member["deductible_individual"] - member["deductible_met"]
+      0.0, member.deductible_individual - member.deductible_met
   )
-  remaining_oop = max(
-      0.0, member["oop_max_individual"] - member["oop_max_met"]
-  )
-
-  applied_to_deductible = min(allowed, remaining_deductible)
-  after_deductible = allowed - applied_to_deductible
+  remaining_oop = max(0.0, member.oop_max_individual - member.oop_max_met)
   coinsurance_rate = (
-      member["coinsurance_in_network"]
-      if in_network
-      else member["coinsurance_out_of_network"]
+      member.coinsurance_in_network
+      if req.in_network
+      else member.coinsurance_out_of_network
   )
-  coinsurance_amount = round(after_deductible * coinsurance_rate, 2)
 
-  patient_resp = min(
-      remaining_oop, round(applied_to_deductible + coinsurance_amount, 2)
+  if coinsurance_rate >= 1.0 and not req.in_network:
+    return CostEstimateResponse(
+        eligible=False,
+        member_id=req.member_id,
+        patient_name=member.full_name,
+        plan_name=member.plan_name,
+        cpt_code=req.cpt_code,
+        network_tier=NetworkStatus.OUT_OF_NETWORK,
+        error=(
+            f"Plan '{member.plan_name}' does not cover out-of-network "
+            "non-emergent procedures (patient pays 100% of billed charges)."
+        ),
+    )
+
+  applied_to_deductible = min(req.estimated_allowed_amount, remaining_deductible)
+  balance_after_deductible = req.estimated_allowed_amount - applied_to_deductible
+  raw_coinsurance = balance_after_deductible * coinsurance_rate
+  total_patient_cost = min(
+      remaining_oop, applied_to_deductible + raw_coinsurance
   )
-  plan_paid = round(allowed - patient_resp, 2)
+  plan_pays = max(0.0, req.estimated_allowed_amount - total_patient_cost)
 
-  return {
-      "member_id": mid,
-      "plan_name": member["plan_name"],
-      "cpt_code": cpt_code,
-      "in_network": in_network,
-      "billed_amount": billed_amount,
-      "estimated_allowed_amount": allowed,
-      "applied_to_deductible": applied_to_deductible,
-      "coinsurance_rate": coinsurance_rate,
-      "coinsurance_amount": coinsurance_amount,
-      "estimated_patient_responsibility": patient_resp,
-      "estimated_plan_paid": plan_paid,
-  }
+  return CostEstimateResponse(
+      eligible=True,
+      member_id=req.member_id,
+      patient_name=member.full_name,
+      plan_name=member.plan_name,
+      cpt_code=req.cpt_code,
+      network_tier=(
+          NetworkStatus.IN_NETWORK
+          if req.in_network
+          else NetworkStatus.OUT_OF_NETWORK
+      ),
+      breakdown=CostEstimateBreakdown(
+          estimated_allowed_amount=round(req.estimated_allowed_amount, 2),
+          remaining_deductible_before_service=round(remaining_deductible, 2),
+          applied_to_deductible=round(applied_to_deductible, 2),
+          coinsurance_rate=coinsurance_rate,
+          applied_coinsurance=round(total_patient_cost - applied_to_deductible, 2),
+          remaining_oop_max_before_service=round(remaining_oop, 2),
+          estimated_patient_responsibility=round(total_patient_cost, 2),
+          estimated_plan_payment=round(plan_pays, 2),
+      ),
+  )
 
 
 def submit_claim_appeal(
     claim_id: str,
     appeal_reason: str,
     supporting_reference: str = "",
-) -> dict[str, Any]:
-  """Submit a formal appeal or retroactive prior-authorization correction for a denied healthcare claim.
+    human_confirmed: bool = True,
+) -> ClaimAppealResponse:
+  """Submits a formal claim appeal for a denied claim with Human-in-the-Loop (HITL) policy verification.
 
   Args:
-    claim_id: The denied claim ID (e.g. 'CLM-2026-9002').
-    appeal_reason: Explanation for why the claim should be reprocessed/approved.
-    supporting_reference: Optional supporting PA number or clinical reference
-      (e.g. 'PA-2026-441').
+    claim_id: The denied claim ID (e.g., 'CLM-2026-9002').
+    appeal_reason: Detailed clinical or administrative justification for appealing
+      the denial.
+    supporting_reference: Optional reference ID such as an existing Prior
+      Authorization number (e.g., 'PA-2026-441') or clinical documentation ID.
+    human_confirmed: Human-in-the-Loop confirmation flag. Must be True for
+      high-stakes appeal execution.
 
   Returns:
-    Confirmation of the submitted appeal and updated claim status.
+    A strictly typed `ClaimAppealResponse` Pydantic model with the appeal tracking
+    record or HITL confirmation prompt.
   """
-  cid = claim_id.strip().upper()
-  if cid not in MOCK_CLAIMS:
-    return {"success": False, "error": f"Claim '{claim_id}' not found."}
+  try:
+    req = SubmitAppealRequest(
+        claim_id=claim_id,
+        appeal_reason=appeal_reason,
+        supporting_reference=supporting_reference,
+        human_confirmed=human_confirmed,
+    )
+  except ValidationError as exc:
+    return ClaimAppealResponse(
+        success=False,
+        error=f"Appeal validation error: {exc}",
+    )
 
-  claim = MOCK_CLAIMS[cid]
-  if claim["status"] != "DENIED":
-    return {
-        "success": False,
-        "claim_id": cid,
-        "current_status": claim["status"],
-        "error": (
-            f"Only DENIED claims can be appealed (current status:"
-            f" {claim['status']})."
+  # Enforce Human-in-the-Loop gate
+  hitl_gate = evaluate_hitl_gate(
+      "submit_claim_appeal", req.model_dump(mode="python")
+  )
+  if hitl_gate is not None:
+    return ClaimAppealResponse.model_validate(hitl_gate)
+
+  claim = repository.get_claim(req.claim_id)
+  if claim is None:
+    return ClaimAppealResponse(
+        success=False,
+        error=f"Claim '{req.claim_id}' not found.",
+    )
+
+  if claim.status.value != "DENIED":
+    return ClaimAppealResponse(
+        success=False,
+        error=(
+            f"Claim '{req.claim_id}' has status '{claim.status.value}'. Only "
+            "claims in 'DENIED' status can be appealed."
         ),
-    }
+    )
 
-  appeal_id = f"APL-2026-{cid.split('-')[-1]}"
-  claim["status"] = "APPEAL_SUBMITTED"
-  claim["appeal_id"] = appeal_id
-  claim["appeal_reason"] = appeal_reason
-  claim["supporting_reference"] = supporting_reference
-
-  return {
-      "success": True,
-      "appeal_id": appeal_id,
-      "claim_id": cid,
-      "member_id": claim["member_id"],
-      "new_status": "APPEAL_SUBMITTED",
-      "appeal_reason": appeal_reason,
-      "supporting_reference": supporting_reference,
-      "estimated_resolution_days": 5,
-      "message": (
-          f"Appeal {appeal_id} submitted for claim {cid}. Status updated to"
-          " APPEAL_SUBMITTED."
+  appeal_id = f"APL-2026-{str(uuid.uuid4().int)[:4]}"
+  timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+  record = AppealRecord(
+      appeal_id=appeal_id,
+      claim_id=req.claim_id,
+      member_id=claim.member_id,
+      patient_name=claim.patient_name,
+      original_denial_code=claim.denial_code,
+      appeal_reason=req.appeal_reason,
+      supporting_reference=req.supporting_reference or "None provided",
+      status=AppealStatus.SUBMITTED_UNDER_REVIEW,
+      submitted_timestamp=timestamp,
+      estimated_resolution_days=10,
+      hitl_verified=req.human_confirmed,
+      next_steps=(
+          "Appeal routed to Clinical & Administrative Review Queue. If "
+          "referencing an approved Prior Authorization (e.g., PA-2026-441), "
+          "facility NPI alignment and claim reprocessing typically complete "
+          "within 5-10 business days."
       ),
-  }
+  )
+  repository.save_appeal(record)
+  log_structured_event(
+      "CLAIM_APPEAL_SUBMITTED",
+      f"Persisted formal claim appeal {appeal_id} for claim {req.claim_id}.",
+      appeal_id=appeal_id,
+      claim_id=req.claim_id,
+      member_id=claim.member_id,
+  )
+  return ClaimAppealResponse(success=True, appeal=record)
 
 
-# ==============================================================================
-# ADK Root Agent & AdkApp Definition
-# ==============================================================================
+def search_clinical_policies_and_guidelines(
+    query: str,
+    top_k: int = 3,
+) -> PolicySearchResponse:
+  """Searches the persistent Clinical Policy & Adjudication Vector Store using semantic cosine similarity.
 
-AGENT_INSTRUCTION = """You are the Healthcare Claims Adjudication & Member Support Agent.
-You assist members, healthcare providers, and claims adjusters with:
-1. Checking member eligibility, plan benefits, deductibles, copays, and out-of-pocket maximums (`get_member_eligibility`).
-2. Listing member claims and checking adjudication statuses (`list_member_claims`).
-3. Investigating specific claim line items, CPT/HCPCS procedures, ICD-10 diagnosis codes, EOBs, and denial codes (`get_claim_details`).
-4. Verifying prior authorizations and identifying NPI or coverage mismatches (`check_prior_authorization`).
-5. Estimating patient out-of-pocket responsibility for procedures (`estimate_patient_responsibility`).
-6. Submitting claim appeals or prior-authorization corrections for denied claims (`submit_claim_appeal`).
+  Args:
+    query: Natural language query, CPT code (e.g., '29881', '81479', '71250'),
+      ICD-10 code, or CARC denial code (e.g., 'CO-197', 'CO-50').
+    top_k: Maximum number of matching policy documents to return (1 to 10).
 
-Always use your tools to retrieve exact numbers, dates, CPT/ICD-10 codes, and denial reasons before answering.
-Present financial breakdowns clearly (Billed Amount, Allowed Amount, Plan Paid, and Patient Responsibility) and suggest actionable next steps when a claim is denied."""
+  Returns:
+    A strictly typed `PolicySearchResponse` Pydantic model containing ranked
+    policy chunks and similarity scores.
+  """
+  try:
+    req = PolicySearchRequest(query=query, top_k=top_k)
+  except ValidationError:
+    req = PolicySearchRequest(query=str(query or "policy")[:500], top_k=3)
 
-root_agent = llm_agent.LlmAgent(
-    name="Healthcare_Claims_Agent",
-    model="gemini-2.5-flash",
-    description=(
-        "ADK Healthcare Claims Agent for member eligibility verification, claim"
-        " status lookup, denial root-cause analysis, prior authorization"
-        " checks, cost estimation, and appeals."
-    ),
-    instruction=AGENT_INSTRUCTION,
-    tools=[
-        get_member_eligibility,
-        list_member_claims,
-        get_claim_details,
-        check_prior_authorization,
-        estimate_patient_responsibility,
-        submit_claim_appeal,
-    ],
+  matches = repository.search_policy_vectors(req.query, top_k=req.top_k)
+  return PolicySearchResponse(
+      query=req.query,
+      count=len(matches),
+      matches=matches,
+  )
+
+
+# ============================================================================
+# Multi-Agent Hierarchy & Strategic Model Routing (Flash + Pro Sub-Agents)
+# ============================================================================
+
+COORDINATOR_INSTRUCTION = """You are the **Healthcare Claims & Member Services Coordinator Agent** for a health insurance payer platform.
+You orchestrate a specialized multi-agent team and have access to schema-validated tools backed by a persistent SQLite database and clinical policy vector store.
+
+### Your Specialized Sub-Agents & Strategic Model Routing
+1. **`Eligibility_And_Benefits_Agent` (`gemini-2.5-flash`)**:
+   - Fast, low-latency specialist for member coverage verification (`get_member_eligibility`) and out-of-pocket cost estimation (`estimate_patient_responsibility`).
+2. **`Clinical_Denial_Analyst_Agent` (`gemini-2.5-pro`)**:
+   - Deep-reasoning clinical specialist for claim status inquiries (`list_member_claims`), line-item CPT/ICD-10 adjudication analysis (`get_claim_details`), prior authorization cross-referencing (`check_prior_authorization`), and semantic vector search over payer policies and CMS LCD guidelines (`search_clinical_policies_and_guidelines`).
+3. **`Appeals_And_Grievances_Specialist_Agent` (`gemini-2.5-pro`)**:
+   - Regulated adjudication specialist for filing formal claim appeals (`submit_claim_appeal`) with Human-in-the-Loop (HITL) policy verification.
+
+### Clinical & Administrative Domain Rules
+- Always cite exact IDs (`MEM-...`, `CLM-...`, `PA-...`, `EOB-...`, `POL-...`), CPT/ICD-10 codes, CARC denial codes (`CO-197`, `CO-50`), and dollar amounts.
+- When investigating a denied or pending claim, ALWAYS check both `get_claim_details`, `check_prior_authorization`, and `search_clinical_policies_and_guidelines` so you can explain the exact root cause and policy remedy (such as `PA-2026-441` facility NPI mismatch under `POL-CARC-197`).
+- Never expose unredacted SSNs or unauthorized PHI.
+"""
+
+PROJECT_ID = secret_manager_service.get_secret(
+    "gcp-project-id", default=os.environ.get("GOOGLE_CLOUD_PROJECT", "arnbtest")
 )
+LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+os.environ.setdefault("GOOGLE_CLOUD_PROJECT", PROJECT_ID or "arnbtest")
+os.environ.setdefault("GOOGLE_CLOUD_LOCATION", LOCATION)
 
-app = AdkApp(agent=root_agent)
+ALL_CLAIMS_TOOLS = [
+    get_member_eligibility,
+    list_member_claims,
+    get_claim_details,
+    check_prior_authorization,
+    estimate_patient_responsibility,
+    submit_claim_appeal,
+    search_clinical_policies_and_guidelines,
+]
+
+if llm_agent is not None:
+  if vertexai is not None:
+    vertexai.init(project=PROJECT_ID, location=LOCATION)
+
+  appeal_tool = (
+      FunctionTool(
+          submit_claim_appeal,
+          require_confirmation=requires_appeal_hitl_confirmation,
+      )
+      if FunctionTool is not None
+      else submit_claim_appeal
+  )
+
+  eligibility_and_benefits_agent = llm_agent.LlmAgent(
+      name="Eligibility_And_Benefits_Agent",
+      model="gemini-2.5-flash",
+      description=(
+          "Low-latency specialist for member eligibility lookups, deductible and "
+          "out-of-pocket accumulators, copay schedules, and procedure cost estimates."
+      ),
+      instruction=(
+          "You are the Eligibility & Benefits Specialist Agent (`gemini-2.5-flash`). "
+          "Use `get_member_eligibility` and `estimate_patient_responsibility` to "
+          "provide exact accumulator balances and out-of-pocket cost breakdowns."
+      ),
+      tools=[get_member_eligibility, estimate_patient_responsibility],
+  )
+
+  clinical_denial_analyst_agent = llm_agent.LlmAgent(
+      name="Clinical_Denial_Analyst_Agent",
+      model="gemini-2.5-pro",
+      description=(
+          "High-reasoning clinical analyst (`gemini-2.5-pro`) for complex claim "
+          "denials (CO-197, CO-50), CPT/ICD-10 line-item adjudication, prior "
+          "authorization NPI verification, and clinical policy vector search."
+      ),
+      instruction=(
+          "You are the Clinical Denial & Policy Analyst Agent (`gemini-2.5-pro`). "
+          "Use `list_member_claims`, `get_claim_details`, `check_prior_authorization`, "
+          "and `search_clinical_policies_and_guidelines` to diagnose claim denials "
+          "and cite specific policy IDs (e.g., POL-CARC-197, POL-LCD-L33965)."
+      ),
+      tools=[
+          list_member_claims,
+          get_claim_details,
+          check_prior_authorization,
+          search_clinical_policies_and_guidelines,
+      ],
+  )
+
+  appeals_and_grievances_agent = llm_agent.LlmAgent(
+      name="Appeals_And_Grievances_Specialist_Agent",
+      model="gemini-2.5-pro",
+      description=(
+          "Regulated adjudication specialist (`gemini-2.5-pro`) for submitting "
+          "formal claim appeals with Human-in-the-Loop confirmation."
+      ),
+      instruction=(
+          "You are the Appeals & Grievances Specialist Agent (`gemini-2.5-pro`). "
+          "Verify claim denial details and prior authorizations, then submit formal "
+          "appeals via `submit_claim_appeal` while respecting Human-in-the-Loop "
+          "confirmation policies."
+      ),
+      tools=[
+          get_claim_details,
+          check_prior_authorization,
+          search_clinical_policies_and_guidelines,
+          appeal_tool,
+      ],
+  )
+
+  root_agent = llm_agent.LlmAgent(
+      name="Healthcare_Claims_Agent",
+      model="gemini-2.5-flash",
+      description=(
+          "Multi-agent Healthcare Claims Adjudication & Member Services Coordinator "
+          "with persistent SQLite/vector retrieval, security guardrails, and HITL appeals."
+      ),
+      instruction=COORDINATOR_INSTRUCTION,
+      tools=ALL_CLAIMS_TOOLS,
+      sub_agents=[
+          eligibility_and_benefits_agent,
+          clinical_denial_analyst_agent,
+          appeals_and_grievances_agent,
+      ],
+  )
+
+  active_plugins = [HealthcareGovernancePlugin()]
+  if ContextFilterPlugin is not None:
+    active_plugins.insert(0, ContextFilterPlugin(num_invocations_to_keep=6))
+
+  app = (
+      AdkApp(
+          agent=root_agent,
+          plugins=active_plugins,
+          enable_tracing=True,
+      )
+      if AdkApp is not None
+      else None
+  )
+else:  # pragma: no cover
+  eligibility_and_benefits_agent = None
+  clinical_denial_analyst_agent = None
+  appeals_and_grievances_agent = None
+  root_agent = None
+  app = None
