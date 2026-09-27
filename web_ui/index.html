@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Healthcare Claims Agent — Vertex AI Agent Engine Console</title>
+  <meta name="description" content="Interactive Healthcare Claims Adjudication & Member Services Chat powered by Google ADK on Vertex AI Agent Engine." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app-layout">
+    <aside class="sidebar" id="reference-sidebar" aria-label="Mock Claims Directory">
+      <div class="sidebar-header">
+        <div class="brand-row">
+          <div class="brand-icon" aria-hidden="true">HC</div>
+          <div class="brand-title">
+            <h1>Healthcare Claims Agent</h1>
+            <div class="brand-subtitle">Google ADK &bull; Vertex AI Engine</div>
+          </div>
+        </div>
+        <div class="engine-meta" id="engine-metadata-box">
+          <div class="engine-meta-row">
+            <span class="engine-meta-label">Status</span>
+            <span class="status-online" id="engine-status-indicator">
+              <span class="status-dot"></span> LIVE (us-central1)
+            </span>
+          </div>
+          <div class="engine-meta-row">
+            <span class="engine-meta-label">Project</span>
+            <span class="engine-meta-val">arnbtest</span>
+          </div>
+          <div class="engine-meta-row">
+            <span class="engine-meta-label">Engine ID</span>
+            <span class="engine-meta-val">6960836041880109056</span>
+          </div>
+          <div class="engine-meta-row">
+            <span class="engine-meta-label">Model</span>
+            <span class="engine-meta-val">gemini-2.5-flash</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="sidebar-scroll">
+        <section aria-labelledby="members-heading">
+          <div class="section-heading" id="members-heading">
+            <span>Mock Members (Click to Query)</span>
+            <span>4</span>
+          </div>
+          <div class="member-list" id="member-directory-list"></div>
+        </section>
+
+        <section aria-labelledby="claims-heading">
+          <div class="section-heading" id="claims-heading">
+            <span>Mock Claims (Click to Inspect)</span>
+            <span>5</span>
+          </div>
+          <div class="claim-list" id="claim-directory-list"></div>
+        </section>
+
+        <section aria-labelledby="pa-heading">
+          <div class="section-heading" id="pa-heading">
+            <span>Prior Authorizations</span>
+            <span>2</span>
+          </div>
+          <div class="claim-list" id="pa-directory-list"></div>
+        </section>
+      </div>
+    </aside>
+
+    <main class="main-pane">
+      <header class="topbar">
+        <div class="topbar-info">
+          <span class="topbar-title">Adjudication &amp; Member Resolution Console</span>
+          <span class="topbar-tag" id="active-session-badge">Session: Ready</span>
+        </div>
+        <div class="topbar-actions">
+          <button type="button" class="btn-secondary" id="btn-reset-session">New Conversation</button>
+        </div>
+      </header>
+
+      <section class="chat-stream" id="chat-stream" aria-live="polite">
+        <div class="welcome-card" id="welcome-card">
+          <h2>Test Your Deployed Healthcare Claims Agent</h2>
+          <p>
+            Connected directly to Vertex AI Reasoning Engine <code>6960836041880109056</code> in project <code>arnbtest</code>. Select any member or claim on the left, or click a workflow below to invoke live ADK tools.
+          </p>
+          <div class="prompt-grid">
+            <button type="button" class="prompt-chip" id="prompt-chip-1" data-prompt="Check the eligibility and claims for Sarah Jenkins (MEM-1001), explain why her surgical claim CLM-2026-9002 was denied, and check if she has a prior authorization on file.">
+              <span class="prompt-chip-label">Denial &amp; Prior Auth Analysis</span>
+              <span class="prompt-chip-text">Check Sarah Jenkins's eligibility, explain why claim CLM-2026-9002 was denied, and verify her prior auth.</span>
+            </button>
+            <button type="button" class="prompt-chip" id="prompt-chip-2" data-prompt="Submit an appeal for claim CLM-2026-9002 on behalf of Sarah Jenkins referencing approved Prior Authorization PA-2026-441 to update the billing facility NPI to Bay Area Surgical Center (NPI-1987654321).">
+              <span class="prompt-chip-label">Submit Claim Appeal</span>
+              <span class="prompt-chip-text">File a formal appeal for denied claim CLM-2026-9002 referencing PA-2026-441 and facility NPI-1987654321.</span>
+            </button>
+            <button type="button" class="prompt-chip" id="prompt-chip-3" data-prompt="Check Michael Chen's (MEM-1002) eligibility, list his claims, and explain why claim CLM-2026-9004 is pending review along with his prior authorization PA-2026-512 status.">
+              <span class="prompt-chip-label">Pending Clinical Review</span>
+              <span class="prompt-chip-text">Inspect Michael Chen's pending Chest CT claim (CLM-2026-9004) and prior authorization PA-2026-512.</span>
+            </button>
+            <button type="button" class="prompt-chip" id="prompt-chip-4" data-prompt="Estimate how much Sarah Jenkins (MEM-1001) would pay out of pocket for an in-network surgical procedure with an allowed amount of $2,500.">
+              <span class="prompt-chip-label">Out-of-Pocket Estimator</span>
+              <span class="prompt-chip-text">Calculate Sarah Jenkins's estimated out-of-pocket cost for a $2,500 in-network procedure.</span>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <footer class="composer-area">
+        <form class="composer-form" id="chat-composer-form">
+          <textarea
+            id="chat-message-input"
+            class="composer-input"
+            rows="1"
+            placeholder="Ask about member eligibility, CPT/ICD-10 claim denials, prior authorizations, cost estimates, or appeals..."
+            required
+          ></textarea>
+          <button type="submit" class="btn-send" id="btn-send-message">Send Query</button>
+        </form>
+      </footer>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
